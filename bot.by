@@ -1,0 +1,176 @@
+import os
+import asyncio
+import logging
+import time
+import xml.etree.ElementTree as ET
+import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.filters.callback_data import CallbackData
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8788599068:AAFHEYXreb_Q0OLRCgLVuWJU44GiIqpEfAo")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# --- Кэширование курсов в памяти ---
+CACHE_TTL = 3600  # Кэш обновляется раз в 1 час (3600 сек)
+CACHE_DATA = {}
+LAST_FETCH_TIME = 0
+
+class CurrencyCallback(CallbackData, prefix="cur"):
+    base: str
+    target: str
+
+POPULAR_PAIRS = [
+    ("USD", "RUB"),
+    ("EUR", "RUB"),
+    ("USD", "EUR"),
+    ("CNY", "RUB"),
+    ("RUB", "AMD"), 
+    ("AMD", "RUB"), 
+]
+
+def get_currency_keyboard():
+    builder = InlineKeyboardBuilder()
+    for base, target in POPULAR_PAIRS:
+        builder.button(
+            text=f"{base} ➡️ {target}",
+            callback_data=CurrencyCallback(base=base, target=target).pack()
+        )
+    builder.adjust(2)
+    return builder.as_markup()
+
+# --- Получение курсов напрямую с официального сайта ЦБ РФ ---
+async def fetch_cbr_rates():
+    global CACHE_DATA, LAST_FETCH_TIME
+    current_time = time.time()
+
+    # Если с момента последнего запроса прошло меньше часа, отдаем данные из памяти мгновенно
+    if CACHE_DATA and (current_time - LAST_FETCH_TIME < CACHE_TTL):
+        return CACHE_DATA
+
+    # Прямой XML-интерфейс Банка России
+    url = "https://www.cbr.ru/scripts/XML_daily.asp"
+    
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as response:
+            if response.status != 200:
+                raise Exception(f"Официальный сервер ЦБ вернул статус {response.status}")
+            xml_data = await response.text(encoding='windows-1251')
+
+    # Парсим XML от ЦБ РФ
+    root = ET.fromstring(xml_data)
+    rates = {"RUB": (1.0, 1)}
+
+    for valute in root.findall('Valute'):
+        char_code = valute.find('CharCode').text
+        nominal = int(valute.find('Nominal').text)
+        # Заменяем запятую на точку для перевода в float
+        value = float(valute.find('Value').text.replace(',', '.'))
+        rates[char_code] = (value, nominal)
+
+    CACHE_DATA = rates
+    LAST_FETCH_TIME = current_time
+    return rates
+
+async def calculate_cbr_exchange(base: str, target: str, amount: float):
+    rates = await fetch_cbr_rates()
+
+    if base not in rates:
+        raise ValueError(f"Валюта {base} не найдена в ЦБ РФ")
+    if target not in rates:
+        raise ValueError(f"Валюта {target} не найдена в ЦБ РФ")
+
+    base_val, base_nom = rates[base]
+    target_val, target_nom = rates[target]
+
+    base_in_rub = base_val / base_nom
+    target_in_rub = target_val / target_nom
+
+    amount_in_rub = amount * base_in_rub
+    final_result = amount_in_rub / target_in_rub
+    rate_1_to_1 = base_in_rub / target_in_rub 
+
+    return final_result, rate_1_to_1
+
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message):
+    await message.answer(
+        "👋 Привет! Я бот-конвертер валют (@KursovichkoffBot по курсу ЦБ РФ).\n\n"
+        "Выберите пару из кнопок ниже (расчет для 100 единиц) "
+        "или отправьте запрос текстом в формате: `100 USD EUR`",
+        reply_markup=get_currency_keyboard(),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(CurrencyCallback.filter())
+async def process_currency_button(callback: types.CallbackQuery, callback_data: CurrencyCallback):
+    base = callback_data.base
+    target = callback_data.target
+    amount = 100.0
+
+    try:
+        result, rate = await calculate_cbr_exchange(base, target, amount)
+        await callback.message.answer(
+            f"🏛 **Курс ЦБ РФ**\n\n"
+            f"📊 1 {base} = **{rate:.2f} {target}**\n"
+            f"💵 {amount:.0f} {base} = **{result:.2f} {target}**",
+            parse_mode="Markdown"
+        )
+    except ValueError as e:
+        await callback.message.answer(f"Ошибка: {e}")
+    except Exception as e:
+        logging.error(f"Подробная ошибка ЦБ РФ: {e}")
+        await callback.message.answer("Сервис курсов временно недоступен.")
+
+    await callback.answer()
+
+@dp.message()
+async def convert_text(message: types.Message):
+    try:
+        parts = message.text.split()
+        if len(parts) != 3:
+            raise ValueError("Неверное количество аргументов")
+
+        amount = float(parts[0])
+        base = parts[1].upper()
+        target = parts[2].upper()
+
+        result, rate = await calculate_cbr_exchange(base, target, amount)
+        
+        await message.answer(
+            f"🏛 **Курс ЦБ РФ**\n"
+            f"💵 {amount} {base} = **{result:.2f} {target}** (по курсу {rate:.2f})",
+            parse_mode="Markdown"
+        )
+    except ValueError as e:
+        if "Неверное количество аргументов" in str(e) or "could not convert" in str(e):
+            await message.answer(
+                "Неверный формат. Используйте: `<сумма> <из валюты> <в валюту>`\nПример: `50 EUR RUB`", 
+                parse_mode="Markdown"
+            )
+        else:
+            await message.answer(str(e))
+    except Exception as e:
+        logging.error(f"Подробная ошибка текста: {e}")
+        await message.answer("Произошла ошибка при запросе курсов ЦБ РФ.")
+
+async def main():
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot)
+        except Exception as e:
+            logging.error(f"Сетевой сбой: {e}. Переподключение через 5 секунд...")
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
